@@ -1,0 +1,11 @@
+{
+  "name": "forma-mcp-server",
+  "version": "0.5.0",
+  "type": "module",
+  "main": "server.js",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "express": "^4.19.2"
+  }
+}
