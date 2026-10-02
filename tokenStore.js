@@ -13,15 +13,20 @@
 
 import fs from "node:fs";
 
-const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-const KEY = process.env.UPSTASH_TOKEN_KEY || "forma-mcp:aps-tokens";
-const HAS_UPSTASH = Boolean(UPSTASH_URL && UPSTASH_TOKEN);
+// Read lazily (at call time), NOT once at module load. auth.js and server.js
+// both load their .env file via a plain function call that runs AFTER their
+// top-level `import` statements have already executed — and ES module imports
+// are evaluated before the rest of the importing file runs. So if these were
+// read once up here, they'd always see "not set", even once .env has loaded.
+const upstashUrl = () => process.env.UPSTASH_REDIS_REST_URL;
+const upstashToken = () => process.env.UPSTASH_REDIS_REST_TOKEN;
+const KEY = () => process.env.UPSTASH_TOKEN_KEY || "forma-mcp:aps-tokens";
+const hasUpstash = () => Boolean(upstashUrl() && upstashToken());
 
 async function redisCmd(cmd) {
-  const res = await fetch(UPSTASH_URL, {
+  const res = await fetch(upstashUrl(), {
     method: "POST",
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${upstashToken()}`, "Content-Type": "application/json" },
     body: JSON.stringify(cmd),
     signal: AbortSignal.timeout(10000),
   });
@@ -56,9 +61,9 @@ function writeLocal(tokenFile, t) {
 // Reads Upstash first (if configured) since that's the shared source of truth;
 // falls back to the local file so things still work with no Upstash set up.
 export async function readTokens(tokenFile) {
-  if (HAS_UPSTASH) {
+  if (hasUpstash()) {
     try {
-      const v = await redisCmd(["GET", KEY]);
+      const v = await redisCmd(["GET", KEY()]);
       if (v) return JSON.parse(v);
     } catch (e) {
       console.error(`[tokenStore] Upstash read failed, falling back to local file: ${e.message}`);
@@ -70,11 +75,11 @@ export async function readTokens(tokenFile) {
 // Writes to BOTH so a local run and a deployed run never disagree.
 export async function writeTokens(tokenFile, t) {
   writeLocal(tokenFile, t);
-  if (HAS_UPSTASH) {
-    await redisCmd(["SET", KEY, JSON.stringify(t)]);
+  if (hasUpstash()) {
+    await redisCmd(["SET", KEY(), JSON.stringify(t)]);
   }
 }
 
 export function tokenStoreStatus() {
-  return HAS_UPSTASH ? `Upstash (key: ${KEY})` : "local file only (set UPSTASH_REDIS_REST_URL/TOKEN to persist on Render)";
+  return hasUpstash() ? `Upstash (key: ${KEY()})` : "local file only (set UPSTASH_REDIS_REST_URL/TOKEN to persist on Render)";
 }
