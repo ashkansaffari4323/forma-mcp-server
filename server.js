@@ -54,9 +54,14 @@ const CLIENT_SECRET = process.env.APS_CLIENT_SECRET || process.env.FORMA_CLIENT_
 const BASE = process.env.APS_BASE_URL || "https://developer.api.autodesk.com";
 
 // v2 uses `user:read`. The legacy `user-profile:read` breaks /userprofile calls.
-const USER_SCOPES =
+// `openid` is required by /userinfo (aps_whoami). Always included, even when
+// APS_SCOPES overrides the default.
+const withOpenId = (s) =>
+  s.split(/\s+/).filter(Boolean).includes("openid") ? s.trim() : `openid ${s.trim()}`;
+const USER_SCOPES = withOpenId(
   process.env.APS_SCOPES ||
-  "data:read data:write data:create data:search account:read account:write user:read";
+    "data:read data:write data:create data:search account:read account:write user:read"
+);
 const APP_SCOPES = process.env.APS_APP_SCOPES || "data:read data:write account:read";
 
 // Data region for your ACC projects: AUS. Needed by some APIs (Account Admin, etc.).
@@ -403,7 +408,20 @@ const TOOLS_ALL = [
     [],
     // Autodesk retired /userprofile/v1/users/@me (returns HTTP 410) in favor
     // of this OIDC-style endpoint.
-    () => aps("GET", "/userinfo", { auth: "user" })
+    // /userinfo requires the `openid` scope — check the saved sign-in first so
+    // the error says exactly what to do instead of a bare 403.
+    async () => {
+      const t = await readTokens();
+      const granted = String(t?.scope || "").split(/\s+/);
+      if (t?.scope && !granted.includes("openid")) {
+        throw new Error(
+          "The saved sign-in was granted without the `openid` scope, which /userinfo requires. " +
+            `Granted scopes: "${t.scope}". Sign in again (node auth.js) so the new scope list is requested — ` +
+            "a refresh cannot add scopes."
+        );
+      }
+      return aps("GET", "/userinfo", { auth: "user" });
+    }
   ),
   tool(
     "aps_auth_status",
@@ -412,7 +430,9 @@ const TOOLS_ALL = [
     {},
     [],
     async () => {
-      const t = readTokens();
+      // readTokens() is async (Upstash/file store) — without await, `t` was a
+      // Promise and user_signin always reported MISSING even when signed in.
+      const t = await readTokens();
       const out = {
         client_id: maskedId,
         client_id_source: process.env.APS_CLIENT_ID ? "APS_CLIENT_ID" : "FORMA_CLIENT_ID",
@@ -420,7 +440,12 @@ const TOOLS_ALL = [
         region: REGION,
         writes_enabled: ALLOW_WRITES,
         token_file: TOKEN_FILE,
+        token_store: tokenStoreStatus(),
         user_signin: t?.refresh_token ? "found" : "MISSING — run: node auth.js",
+        user_scopes: t?.scope || "(unknown)",
+        openid_granted: String(t?.scope || "").split(/\s+/).includes("openid")
+          ? "yes"
+          : "NO — sign in again (node auth.js) so aps_whoami works",
       };
       if (t?.expires_at) {
         const mins = Math.round((t.expires_at - Date.now()) / 60000);
