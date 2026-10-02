@@ -401,7 +401,9 @@ const TOOLS_ALL = [
     "Show which Autodesk user the server is signed in as. Use this first to confirm the connection works.",
     {},
     [],
-    () => aps("GET", "/userprofile/v1/users/@me", { auth: "user" })
+    // Autodesk retired /userprofile/v1/users/@me (returns HTTP 410) in favor
+    // of this OIDC-style endpoint.
+    () => aps("GET", "/userinfo", { auth: "user" })
   ),
   tool(
     "aps_auth_status",
