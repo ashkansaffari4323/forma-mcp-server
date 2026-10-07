@@ -54,14 +54,10 @@ const CLIENT_SECRET = process.env.APS_CLIENT_SECRET || process.env.FORMA_CLIENT_
 const BASE = process.env.APS_BASE_URL || "https://developer.api.autodesk.com";
 
 // v2 uses `user:read`. The legacy `user-profile:read` breaks /userprofile calls.
-// `openid` is required by /userinfo (aps_whoami). Always included, even when
-// APS_SCOPES overrides the default.
-const withOpenId = (s) =>
-  s.split(/\s+/).filter(Boolean).includes("openid") ? s.trim() : `openid ${s.trim()}`;
-const USER_SCOPES = withOpenId(
+// `openid` is required specifically by the /userinfo endpoint (aps_whoami).
+const USER_SCOPES =
   process.env.APS_SCOPES ||
-    "data:read data:write data:create data:search account:read account:write user:read"
-);
+  "openid data:read data:write data:create data:search account:read account:write user:read";
 const APP_SCOPES = process.env.APS_APP_SCOPES || "data:read data:write account:read";
 
 // Data region for your ACC projects: AUS. Needed by some APIs (Account Admin, etc.).
@@ -368,6 +364,13 @@ REPORTS (Data Connector; needs Account Executive or project admin)
   GET /modelderivative/v2/designdata/{urn}/manifest
   GET /modelderivative/v2/designdata/{urn}/metadata
   GET /modelderivative/v2/designdata/{urn}/metadata/{viewGuid} | /properties
+BUILDINGCONNECTED (bid management; 3-legged/signed-in user only, access gated separately by Autodesk)
+  GET /construction/buildingconnected/v2/projects | bid-packages | opportunities | invites | bids | users | offices | financials | qualifications
+  GET /construction/buildingconnected/v2/projects/{id} | bid-packages/{id} | opportunities/{id} | invites/{id}
+  GET /construction/buildingconnected/v2/projects/{id}/costs
+  GET /construction/buildingconnected/v2/bids/{id}/line-items | /plugs
+  GET /construction/buildingconnected/v2/{project-bid-forms|scope-specific-bid-forms}/{id}/line-items
+  GET /construction/buildingconnected/v2/opportunities/{id}/comments
 
 PAGING: most list endpoints accept limit and offset (some use a cursor); pass them via the query argument.
 WRITES (server needs ALLOW_WRITES=true, and the call needs confirm=true after the user approves the exact change).
@@ -398,6 +401,28 @@ const BUILD_GET = {
 const COST_LIST = ["budgets", "contracts", "main-contracts", "cost-items", "expenses", "payments", "change-orders"];
 const CO_TYPES = "pco, rfq, rco, oco or sco";
 
+const BC_BASE = "/construction/buildingconnected/v2";
+const BC_LIST = {
+  projects: `${BC_BASE}/projects`,
+  "bid-packages": `${BC_BASE}/bid-packages`,
+  invites: `${BC_BASE}/invites`,
+  bids: `${BC_BASE}/bids`,
+  "project-bid-forms": `${BC_BASE}/project-bid-forms`,
+  "scope-specific-bid-forms": `${BC_BASE}/scope-specific-bid-forms`,
+  opportunities: `${BC_BASE}/opportunities`,
+  contacts: `${BC_BASE}/contacts`,
+  users: `${BC_BASE}/users`,
+  offices: `${BC_BASE}/offices`,
+  financials: `${BC_BASE}/financials`,
+  qualifications: `${BC_BASE}/qualifications`,
+};
+const BC_GET = {
+  projects: (id) => `${BC_BASE}/projects/${id}`,
+  "bid-packages": (id) => `${BC_BASE}/bid-packages/${id}`,
+  invites: (id) => `${BC_BASE}/invites/${id}`,
+  opportunities: (id) => `${BC_BASE}/opportunities/${id}`,
+};
+
 const TOOLS_ALL = [
   // ===== core =====
   tool(
@@ -408,20 +433,7 @@ const TOOLS_ALL = [
     [],
     // Autodesk retired /userprofile/v1/users/@me (returns HTTP 410) in favor
     // of this OIDC-style endpoint.
-    // /userinfo requires the `openid` scope — check the saved sign-in first so
-    // the error says exactly what to do instead of a bare 403.
-    async () => {
-      const t = await readTokens();
-      const granted = String(t?.scope || "").split(/\s+/);
-      if (t?.scope && !granted.includes("openid")) {
-        throw new Error(
-          "The saved sign-in was granted without the `openid` scope, which /userinfo requires. " +
-            `Granted scopes: "${t.scope}". Sign in again (node auth.js) so the new scope list is requested — ` +
-            "a refresh cannot add scopes."
-        );
-      }
-      return aps("GET", "/userinfo", { auth: "user" });
-    }
+    () => aps("GET", "/userinfo", { auth: "user" })
   ),
   tool(
     "aps_auth_status",
@@ -430,9 +442,7 @@ const TOOLS_ALL = [
     {},
     [],
     async () => {
-      // readTokens() is async (Upstash/file store) — without await, `t` was a
-      // Promise and user_signin always reported MISSING even when signed in.
-      const t = await readTokens();
+      const t = readTokens();
       const out = {
         client_id: maskedId,
         client_id_source: process.env.APS_CLIENT_ID ? "APS_CLIENT_ID" : "FORMA_CLIENT_ID",
@@ -440,12 +450,7 @@ const TOOLS_ALL = [
         region: REGION,
         writes_enabled: ALLOW_WRITES,
         token_file: TOKEN_FILE,
-        token_store: tokenStoreStatus(),
         user_signin: t?.refresh_token ? "found" : "MISSING — run: node auth.js",
-        user_scopes: t?.scope || "(unknown)",
-        openid_granted: String(t?.scope || "").split(/\s+/).includes("openid")
-          ? "yes"
-          : "NO — sign in again (node auth.js) so aps_whoami works",
       };
       if (t?.expires_at) {
         const mins = Math.round((t.expires_at - Date.now()) / 60000);
@@ -854,6 +859,83 @@ const TOOLS_ALL = [
     { projectId: S("The Forma project id.") },
     ["projectId"],
     (a) => (need(a, "projectId"), aps("GET", `/forma/v1alpha/generators?projectId=${enc(a.projectId)}`, { auth: "app" }))
+  ),
+
+  // ===== BuildingConnected (bid management) =====
+  // NOTE: BuildingConnected API access is gated separately by Autodesk — contact
+  // your Account Executive / Customer Success Manager to get it enabled for your
+  // app's client_id, even once the app itself is otherwise working. 3-legged
+  // (signed-in user) auth only; there is no app-only access for this API.
+  tool(
+    "bc_whoami",
+    "buildingconnected",
+    "Show the signed-in user's own BuildingConnected profile. Good first call to confirm BuildingConnected access is granted.",
+    {},
+    [],
+    () => aps("GET", `${BC_BASE}/users/me`, { auth: "user" })
+  ),
+  tool(
+    "bc_list",
+    "buildingconnected",
+    `List BuildingConnected records: ${Object.keys(BC_LIST).join(", ")}. Filter/page with query, e.g. filter[clientCompanyId]=xyz.`,
+    { resource: E(Object.keys(BC_LIST), "What to list."), query: QUERY },
+    ["resource"],
+    (a) => {
+      need(a, "resource");
+      if (!BC_LIST[a.resource]) throw new Error(`resource must be one of: ${Object.keys(BC_LIST).join(", ")}`);
+      return aps("GET", BC_LIST[a.resource], { query: a.query, auth: "user" });
+    }
+  ),
+  tool(
+    "bc_get",
+    "buildingconnected",
+    "Get one BuildingConnected record by id: a project, bid package, invite, or opportunity.",
+    { resource: E(Object.keys(BC_GET), "What kind of record."), id: S("The record id."), query: QUERY },
+    ["resource", "id"],
+    (a) => {
+      need(a, "resource", "id");
+      if (!BC_GET[a.resource]) throw new Error(`resource must be one of: ${Object.keys(BC_GET).join(", ")}`);
+      return aps("GET", BC_GET[a.resource](enc(a.id)), { query: a.query, auth: "user" });
+    }
+  ),
+  tool(
+    "bc_project_costs",
+    "buildingconnected",
+    "Get the cost breakdown for a BuildingConnected project.",
+    { projectId: S("BuildingConnected project id (from bc_list with resource=projects).") },
+    ["projectId"],
+    (a) => (need(a, "projectId"), aps("GET", `${BC_BASE}/projects/${enc(a.projectId)}/costs`, { auth: "user" }))
+  ),
+  tool(
+    "bc_bid_detail",
+    "buildingconnected",
+    "Get the line items or plugs (unit-price entries) submitted for a specific bid.",
+    { bidId: S("Bid id (from an opportunity's bid, or bc_list resource=bids)."), part: E(["line-items", "plugs"], "Which detail to fetch.") },
+    ["bidId", "part"],
+    (a) => (need(a, "bidId", "part"), aps("GET", `${BC_BASE}/bids/${enc(a.bidId)}/${a.part}`, { auth: "user" }))
+  ),
+  tool(
+    "bc_bid_form_line_items",
+    "buildingconnected",
+    "Get the line items on a project bid form or a scope-specific bid form.",
+    {
+      formType: E(["project-bid-forms", "scope-specific-bid-forms"], "Which kind of bid form."),
+      formId: S("The bid form id (from bc_list with the matching resource)."),
+    },
+    ["formType", "formId"],
+    (a) => (need(a, "formType", "formId"), aps("GET", `${BC_BASE}/${a.formType}/${enc(a.formId)}/line-items`, { auth: "user" }))
+  ),
+  tool(
+    "bc_opportunity_comments",
+    "buildingconnected",
+    "List comments on an opportunity, or get one comment by id. Only works if the opportunity's owning office has a Bid Board Pro subscription.",
+    { opportunityId: S("Opportunity id (from bc_list with resource=opportunities)."), commentId: S("Optional: a specific comment id.") },
+    ["opportunityId"],
+    (a) => {
+      need(a, "opportunityId");
+      const base = `${BC_BASE}/opportunities/${enc(a.opportunityId)}/comments`;
+      return aps("GET", a.commentId ? `${base}/${enc(a.commentId)}` : base, { auth: "user" });
+    }
   ),
 
   // ===== generic access to any Autodesk API =====
